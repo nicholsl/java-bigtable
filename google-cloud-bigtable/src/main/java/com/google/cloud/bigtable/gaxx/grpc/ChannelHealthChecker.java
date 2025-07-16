@@ -1,25 +1,21 @@
 package com.google.cloud.bigtable.gaxx.grpc;
 
 import com.google.common.collect.EvictingQueue; // Assuming Guava EvictingQueue
-    import com.google.common.util.concurrent.FutureCallback;
-    import com.google.common.util.concurrent.Futures;
-    import com.google.common.util.concurrent.ListenableFuture;
+import com.google.common.util.concurrent.FutureCallback;
+import com.google.common.util.concurrent.Futures;
+import com.google.common.util.concurrent.ListenableFuture;
+import com.google.cloud.bigtable.gaxx.grpc.BigtableChannelPool.Entry;
 
-    import java.time.Instant;
-    import java.util.concurrent.Executor; // For general Executor interface
-    import java.util.concurrent.Future;
-    import java.util.concurrent.ScheduledExecutorService;
-    import java.util.concurrent.ScheduledFuture;
-    import java.util.concurrent.TimeUnit;
-    import java.util.concurrent.atomic.AtomicInteger;
-    import java.util.concurrent.locks.ReadWriteLock;
-    import java.util.concurrent.locks.ReentrantReadWriteLock;
-// Import for your 'Channel' interface/class and 'probe' method
-
-// Placeholder for Channel and probe method
-interface Channel {
-  // ...
-}
+import io.grpc.internal.ClientTransport.PingCallback;
+import java.time.Instant;
+import java.util.concurrent.Executor; // For general Executor interface
+import java.util.concurrent.Future;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.locks.ReadWriteLock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 public class ChannelHealthChecker {
 
@@ -30,7 +26,7 @@ public class ChannelHealthChecker {
   private static final int MIN_PROBES_FOR_EVALUATION = 4; // Changed name for clarity
   private static final int FAILURE_PERCENT_THRESHOLD = 60; // percent
 
-  private final Channel channel;
+  final Entry entry;
   private final ScheduledExecutorService probeExecutor; // Executor for running probes
 
   // Use volatile for shared mutable reference or ensure thread-safe assignment if reassigned
@@ -59,11 +55,11 @@ public class ChannelHealthChecker {
 
   // Assume this is called by some other code.
   // The executor passed should be a ScheduledExecutorService
-  public ChannelHealthChecker(Channel channel, ScheduledExecutorService executor) {
+  public ChannelHealthChecker(Entry entry, ScheduledExecutorService executor) {
     // Calculate queue capacity: 5 minutes * 60 seconds/minute / 30 seconds/probe = 10 probes
     int queueCapacity = (WINDOW_DURATION_MINUTES * 60) / PROBE_RATE_SECONDS;
     this.probeResults = EvictingQueue.create(queueCapacity); // Guava EvictingQueue
-    this.channel = channel;
+    this.entry = entry;
     this.probeExecutor = executor; // Initialize the executor
 
     // TODO: add some jitter. This scheduleAtFixedRate doesn't inherently add jitter.
@@ -97,120 +93,49 @@ public class ChannelHealthChecker {
 
   private void runProbe() {
     Instant startTime = Instant.now();
-    probesInFlight.incrementAndGet(); // Increment when we *attempt* to run a probe
-
+    probesInFlight.incrementAndGet();
     try {
-      // Assume 'probe' method is provided externally and returns a ListenableFuture<Boolean>
-      // (e.g., from a gRPC channel or similar)
-      ListenableFuture<Boolean> probeFuture = (ListenableFuture<Boolean>) probe(channel, PROBE_DEADLINE_MILLISECONDS, startTime);
-
-      Futures.addCallback(
-          Futures.withTimeout(probeFuture, PROBE_DEADLINE_MILLISECONDS, TimeUnit.MILLISECONDS, probeExecutor),
-          new FutureCallback<Boolean>() {
-            @Override
-            public void onSuccess(Boolean result) {
-              probeFinished(startTime, result);
-            }
-
-            @Override
-            public void onFailure(Throwable t) {
-              // This handles timeouts and other exceptions during probe execution
-              probeFinished(startTime, /*success=*/ false);
-              // Consider logging the error here
-              // System.err.println("Probe failed or timed out: " + t.getMessage());
-            }
-          },
-          probeExecutor // Execute the callback on the probeExecutor's thread
-      );
-    } catch (Exception e) {
-      // This catches exceptions that happen *before* the ListenableFuture is successfully created/scheduled
-      // e.g., if the 'probe' method itself throws an immediate exception
-      probeResultsLock.writeLock().lock();
-      try {
-        probeResults.add(new ProbeResult(startTime, false));
-      } finally {
-        probeResultsLock.writeLock().unlock();
+      // Assume that this probe method has been provided somewhere (in a similar manner to how channel priming works).
+      int PROBE_DEADLINE = 500; // milliseconds
+      Future probeFuture = PingAndWarm(channel, PROBE_DEADLINE, startTime);
+      Futures.withTimeout(probeFuture, PROBE_DEADLINE, this.probeExecutor).addListener(this::probeFinished);
+    catch {
+        probeResults.add(ProbeResult(startTime, /*success=*/False));
+        // TODO: are there cases where we double-decrement due to calling the listener and then getting an exception?
+        probesInFlight.decrementAndGet();
       }
-      probesInFlight.decrementAndGet(); // Decrement as the probe never truly "started" as a Future
-      // Consider logging this failure to schedule/start the probe
-      // System.err.println("Failed to start probe: " + e.getMessage());
+     }
     }
-  }
 
-  // This method is called by the FutureCallback when the probe (successfully or unsuccessfully) completes
-  void probeFinished(Instant startTime, boolean success) {
-    probeResultsLock.writeLock().lock();
-    try {
-      probeResults.add(new ProbeResult(startTime, success));
-    } finally {
-      probeResultsLock.writeLock().unlock();
+    void probeFinished(Instant startTime, bool success) {
+      probeResults.add(ProbeResult(startTime, success));
+      probesInFlight.decrementAndGet();
     }
-    probesInFlight.decrementAndGet();
-  }
 
-  private int recentProbesSent() {
-    // Also count in-flight requests.
-    int historicalProbesCount;
-    probeResultsLock.readLock().lock();
-    try {
-      historicalProbesCount = probeResults.size();
-    } finally {
-      probeResultsLock.readLock().unlock();
+    private int recentProbesSent() {
+      // Also count in-flight requests.
+      return probesInFlight.get() + probeResults.length();
     }
-    return probesInFlight.get() + historicalProbesCount;
-  }
 
-  public int recentlyFailedProbes() {
-    // A failure is any probe that
-    // - Returned any error code
-    // - Has not completed (is still in flight)
-    // - Failed to start (handled in runProbe's catch block, added to probeResults)
+    public int recentlyFailedProbes() {
+      // A failure is any probe that
+      // - Returned any error code
+      // - Has not completed (is still in flight)
+      // - Failed to start
 
-    // Count in-flight requests as failed.
-    int failedProbes = probesInFlight.get(); // Probes currently in flight are considered failed for health check
-
-    probeResultsLock.readLock().lock();
-    try {
-      for (ProbeResult probeResult : probeResults) {
-        if (!probeResult.isSuccessful()) {
+      // Count in-flight requests as failed.
+      int failedProbes = probesInFlight.get();
+      for (probeResult: probeResults) {
+        if (!result.isSuccessful()) {
           failedProbes++;
         }
       }
-    } finally {
-      probeResultsLock.readLock().unlock();
-    }
-    return failedProbes;
-  }
-
-  public boolean healthy() {
-    int totalProbes = recentProbesSent();
-    if (totalProbes == 0) {
-      // No probes sent yet. Default to healthy until enough data is collected.
-      return true;
+      return failedProbes;
     }
 
-    // If there aren't enough probes for a meaningful statistical evaluation,
-    // consider the system healthy. This prevents premature "unhealthy" status.
-    if (totalProbes < MIN_PROBES_FOR_EVALUATION) {
-      return true;
+    public boolean healthy() {
+      MIN_PROBES_FOR_EVICTION = 4;
+      int FAILURE_PERCENT = 60; // percent
+      return recentProbesSent() <= MIN_PROBES_FOR_EVICTION || (recentlyFailedProbes() / recentProbesSent()) * 100 < FAILURE_PERCENT;
     }
-
-    int failedProbes = recentlyFailedProbes();
-    // Calculate failure percentage using double for accurate division
-    double failureRate = ((double) failedProbes / totalProbes) * 100;
-
-    return failureRate < FAILURE_PERCENT_THRESHOLD;
   }
-
-  // Placeholder for the external probe method
-  // This method should ideally return a ListenableFuture<Boolean>
-  private Future<?> probe(Channel channel, int deadlineMillis, Instant startTime) {
-    // Simulate an asynchronous probe operation
-    // In a real scenario, this would involve calling a service,
-    // potentially with a timeout, and returning a Future.
-    return probeExecutor.schedule(() -> {
-      // Simulate probe success/failure randomly for demonstration
-      return Math.random() > 0.2; // 80% success rate
-    }, (long) (Math.random() * deadlineMillis), TimeUnit.MILLISECONDS);
-  }
-}

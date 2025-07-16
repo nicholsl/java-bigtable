@@ -33,6 +33,7 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.TimeUnit;
@@ -42,6 +43,7 @@ import java.util.concurrent.atomic.AtomicReference;
 import java.util.logging.Level;
 import java.util.logging.Logger;
 import javax.annotation.Nullable;
+import com.google.cloud.bigtable.gaxx.grpc.ChannelPoolHealthChecker;
 
 /**
  * A {@link ManagedChannel} that will send requests round-robin via a set of channels.
@@ -66,6 +68,8 @@ public class BigtableChannelPool extends ManagedChannel {
   @VisibleForTesting final AtomicReference<ImmutableList<Entry>> entries = new AtomicReference<>();
   private final AtomicInteger indexTicker = new AtomicInteger();
   private final String authority;
+
+  private final ChannelPoolHealthChecker poolHealthChecker = new ChannelPoolHealthChecker(() -> entries.get());
 
   public static BigtableChannelPool create(
       BigtableChannelPoolSettings settings, ChannelFactory channelFactory) throws IOException {
@@ -92,7 +96,8 @@ public class BigtableChannelPool extends ManagedChannel {
     ImmutableList.Builder<Entry> initialListBuilder = ImmutableList.builder();
 
     for (int i = 0; i < settings.getInitialChannelCount(); i++) {
-      initialListBuilder.add(new Entry(channelFactory.createSingleChannel()));
+      Entry entry = new Entry(channelFactory.createSingleChannel());
+      initialListBuilder.add(entry);
     }
 
     entries.set(initialListBuilder.build());
@@ -411,7 +416,7 @@ public class BigtableChannelPool extends ManagedChannel {
 
   /** Bundles a gRPC {@link ManagedChannel} with some usage accounting. */
   static class Entry {
-    private final ManagedChannel channel;
+    final ManagedChannel channel;
 
     /**
      * The primary purpose of keeping a count for outstanding RPCs is to track when a channel is
@@ -444,6 +449,9 @@ public class BigtableChannelPool extends ManagedChannel {
       return maxOutstanding.getAndSet(outstandingRpcs.get());
     }
 
+    ManagedChannel getManagedChannel() {
+      return this.channel;
+    }
     /**
      * Try to increment the outstanding RPC count. The method will return false if the channel is
      * closing and the caller should pick a different channel. If the method returned true, the
@@ -454,7 +462,7 @@ public class BigtableChannelPool extends ManagedChannel {
       // register desire to start RPC
       int currentOutstanding = outstandingRpcs.incrementAndGet();
 
-      // Rough book keeping
+      // Rough bookkeeping
       int prevMax = maxOutstanding.get();
       if (currentOutstanding > prevMax) {
         maxOutstanding.incrementAndGet();
@@ -489,7 +497,7 @@ public class BigtableChannelPool extends ManagedChannel {
      * Request a shutdown. The actual shutdown will be delayed until there are no more outstanding
      * RPCs.
      */
-    private void requestShutdown() {
+    void requestShutdown() {
       shutdownRequested.set(true);
       if (outstandingRpcs.get() == 0) {
         shutdown();
